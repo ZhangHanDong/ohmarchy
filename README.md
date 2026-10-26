@@ -29,6 +29,11 @@ oseasy/50-make-installer-iso.sh # Debian netinst ISO carrying the Omarchy disk i
 oseasy/60-push-iso.sh           # copy the ISO to the HarmonyOS Download folder
 ```
 
+On macOS (or without the host tools), run the steps in a container with
+`oseasy/in-docker.sh STEP...`, for example
+`oseasy/in-docker.sh 27-build-aquamarine 28-build-extras 40-build-boot 50-make-installer-iso`;
+25 and 60 still run on the host.
+
 Then follow the install steps in [docs/oseasy-whole-os.md](docs/oseasy-whole-os.md#install-in-oseasy).
 Settings live in `oseasy/config.sh`; outputs go to `work/`.
 
