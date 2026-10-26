@@ -1,0 +1,13 @@
+[Unit]
+Description=ohmarchy: per-user settings for the Oseasy VM
+# After provisioning has created the owner, before their first Hyprland session.
+After=omarchy-provision-owner.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/ohmarchy-oseasy-setup user
+
+[Install]
+WantedBy=multi-user.target

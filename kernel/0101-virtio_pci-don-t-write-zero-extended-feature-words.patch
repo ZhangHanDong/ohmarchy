@@ -1,0 +1,42 @@
+From dd0b64935f2ea550cab05d508dafd3fe65f6a4a4 Mon Sep 17 00:00:00 2001
+From: ohmarchy <ohmarchy@localhost>
+Date: Fri, 23 Oct 2026 16:07:57 +0800
+Subject: [PATCH] virtio_pci: don't write zero extended feature words
+
+Since v6.18 the modern virtio-pci driver writes all four 32-bit guest
+feature words, selecting words 2 and 3 even when the device offers no
+feature above bit 63. StratoVirt, the VMM behind the HarmonyOS PC VM
+apps, rejects a guest_feature write with a select above 1, and under the
+HarmonyOS hypervisor the VM then freezes on the first virtio probe.
+
+Those words are zero after reset, so skip writing them while they would
+stay zero. Devices with extended features still see every word that
+carries a set bit.
+---
+ drivers/virtio/virtio_pci_modern_dev.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/virtio/virtio_pci_modern_dev.c b/drivers/virtio/virtio_pci_modern_dev.c
+index 413a8c3..abf7a7b 100644
+--- a/drivers/virtio/virtio_pci_modern_dev.c
++++ b/drivers/virtio/virtio_pci_modern_dev.c
+@@ -451,6 +451,16 @@ void vp_modern_set_extended_features(struct virtio_pci_modern_device *mdev,
+ 	for (i = 0; i < VIRTIO_FEATURES_BITS / 32; i++) {
+ 		u32 cur = features[i >> 1] >> (32 * (i & 1));
+ 
++		/*
++		 * Feature words above the first 64 bits are zero after reset.
++		 * Some devices predate extended features and reject a
++		 * guest_feature write with a select above 1 (StratoVirt treats
++		 * it as an error, and the HarmonyOS hypervisor then stops the
++		 * VM), so leave words that would stay zero untouched.
++		 */
++		if (i >= 2 && !cur)
++			continue;
++
+ 		vp_iowrite32(i, &cfg->guest_feature_select);
+ 		vp_iowrite32(cur, &cfg->guest_feature);
+ 	}
+-- 
+2.54.0 (Apple Git-157)
+

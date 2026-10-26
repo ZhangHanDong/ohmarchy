@@ -1,0 +1,166 @@
+From 5b0052aa83f86b3b9018c913538bb48ef78d8d24 Mon Sep 17 00:00:00 2001
+From: ohmarchy <ohmarchy@localhost>
+Date: Fri, 23 Oct 2026 11:13:52 +0800
+Subject: [PATCH] arm64: optionally read ID registers added after v6.1 as zero
+
+The HarmonyOS PC hypervisor behind StratoVirt (the Oseasy VM) injects an
+undefined-instruction exception when a guest reads an ID register it does not
+know, where the architecture requires unallocated ID registers to read as
+zero. v6.5 (edc25898f0b6, "arm64: cpufeature: add system register
+ID_AA64MMFR3_EL1") started reading ID_AA64MMFR3_EL1 in __cpu_setup, so every
+later kernel hangs before its console comes up. Later kernels added
+ID_AA64MMFR4_EL1, ID_AA64PFR2_EL1, ID_AA64FPFR0_EL1 and ID_AA64ISAR3_EL1.
+
+CONFIG_ARM64_RAZ_NEW_ID_REGS reads those five as zero in __cpu_setup,
+__cpuinfo_store_cpu() and __read_sysreg_by_encoding(), the only places a
+guest booted at EL1 reads them directly. The kernel then uses none of the
+features they advertise.
+---
+ arch/arm64/Kconfig             | 16 ++++++++++++++++
+ arch/arm64/kernel/cpufeature.c | 20 ++++++++++++++++----
+ arch/arm64/kernel/cpuinfo.c    | 17 ++++++++++++-----
+ arch/arm64/mm/proc.S           |  8 ++++++++
+ 4 files changed, 52 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 89b6a7d..cd80cd2 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1764,6 +1764,22 @@ config MITIGATE_SPECTRE_BRANCH_HISTORY
+ 	  When taking an exception from user-space, a sequence of branches
+ 	  or a firmware call overwrites the branch history.
+ 
++config ARM64_RAZ_NEW_ID_REGS
++	bool "Treat ID registers added after v6.1 as reading zero"
++	help
++	  Some hypervisors trap guest reads of the AArch64 ID register space
++	  and inject an undefined-instruction exception for encodings they do
++	  not know, instead of returning zero as the architecture requires
++	  for unallocated ID registers. The HarmonyOS PC hypervisor behind
++	  StratoVirt (the Oseasy VM) is one: a guest kernel that reads
++	  ID_AA64MMFR3_EL1, which v6.5 started doing in __cpu_setup, hangs
++	  before the console comes up.
++
++	  Say Y to read ID_AA64MMFR3_EL1, ID_AA64MMFR4_EL1, ID_AA64PFR2_EL1,
++	  ID_AA64FPFR0_EL1 and ID_AA64ISAR3_EL1 as zero instead of from the
++	  CPU. The kernel then uses none of the features those registers
++	  advertise. Only for guests of such a hypervisor; if unsure, say N.
++
+ config ARM64_SW_TTBR0_PAN
+ 	bool "Emulate Privileged Access Never using TTBR0_EL1 switching"
+ 	depends on !KCSAN
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index 5dbc20d..727b524 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -1592,21 +1592,33 @@ u64 __read_sysreg_by_encoding(u32 sys_id)
+ 
+ 	read_sysreg_case(SYS_ID_AA64PFR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64PFR1_EL1);
+-	read_sysreg_case(SYS_ID_AA64PFR2_EL1);
+ 	read_sysreg_case(SYS_ID_AA64ZFR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64SMFR0_EL1);
+-	read_sysreg_case(SYS_ID_AA64FPFR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64DFR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64DFR1_EL1);
+ 	read_sysreg_case(SYS_ID_AA64MMFR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64MMFR1_EL1);
+ 	read_sysreg_case(SYS_ID_AA64MMFR2_EL1);
+-	read_sysreg_case(SYS_ID_AA64MMFR3_EL1);
+-	read_sysreg_case(SYS_ID_AA64MMFR4_EL1);
+ 	read_sysreg_case(SYS_ID_AA64ISAR0_EL1);
+ 	read_sysreg_case(SYS_ID_AA64ISAR1_EL1);
+ 	read_sysreg_case(SYS_ID_AA64ISAR2_EL1);
++
++#ifdef CONFIG_ARM64_RAZ_NEW_ID_REGS
++	/* See CONFIG_ARM64_RAZ_NEW_ID_REGS. */
++	case SYS_ID_AA64PFR2_EL1:
++	case SYS_ID_AA64FPFR0_EL1:
++	case SYS_ID_AA64MMFR3_EL1:
++	case SYS_ID_AA64MMFR4_EL1:
++	case SYS_ID_AA64ISAR3_EL1:
++		val = 0;
++		break;
++#else
++	read_sysreg_case(SYS_ID_AA64PFR2_EL1);
++	read_sysreg_case(SYS_ID_AA64FPFR0_EL1);
++	read_sysreg_case(SYS_ID_AA64MMFR3_EL1);
++	read_sysreg_case(SYS_ID_AA64MMFR4_EL1);
+ 	read_sysreg_case(SYS_ID_AA64ISAR3_EL1);
++#endif
+ 
+ 	read_sysreg_case(SYS_CNTFRQ_EL0);
+ 	read_sysreg_case(SYS_CTR_EL0);
+diff --git a/arch/arm64/kernel/cpuinfo.c b/arch/arm64/kernel/cpuinfo.c
+index 45c63f3..91c4dc5 100644
+--- a/arch/arm64/kernel/cpuinfo.c
++++ b/arch/arm64/kernel/cpuinfo.c
+@@ -467,6 +467,13 @@ static void __cpuinfo_store_cpu_32bit(struct cpuinfo_32bit *info)
+ 	info->reg_mvfr2 = read_cpuid(MVFR2_EL1);
+ }
+ 
++/* See CONFIG_ARM64_RAZ_NEW_ID_REGS: ID registers added after v6.1 read as zero. */
++#ifdef CONFIG_ARM64_RAZ_NEW_ID_REGS
++#define read_cpuid_new(reg)	0
++#else
++#define read_cpuid_new(reg)	read_cpuid(reg)
++#endif
++
+ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
+ {
+ 	info->reg_cntfrq = arch_timer_get_cntfrq();
+@@ -489,18 +496,18 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
+ 	info->reg_id_aa64isar0 = read_cpuid(ID_AA64ISAR0_EL1);
+ 	info->reg_id_aa64isar1 = read_cpuid(ID_AA64ISAR1_EL1);
+ 	info->reg_id_aa64isar2 = read_cpuid(ID_AA64ISAR2_EL1);
+-	info->reg_id_aa64isar3 = read_cpuid(ID_AA64ISAR3_EL1);
++	info->reg_id_aa64isar3 = read_cpuid_new(ID_AA64ISAR3_EL1);
+ 	info->reg_id_aa64mmfr0 = read_cpuid(ID_AA64MMFR0_EL1);
+ 	info->reg_id_aa64mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);
+ 	info->reg_id_aa64mmfr2 = read_cpuid(ID_AA64MMFR2_EL1);
+-	info->reg_id_aa64mmfr3 = read_cpuid(ID_AA64MMFR3_EL1);
+-	info->reg_id_aa64mmfr4 = read_cpuid(ID_AA64MMFR4_EL1);
++	info->reg_id_aa64mmfr3 = read_cpuid_new(ID_AA64MMFR3_EL1);
++	info->reg_id_aa64mmfr4 = read_cpuid_new(ID_AA64MMFR4_EL1);
+ 	info->reg_id_aa64pfr0 = read_cpuid(ID_AA64PFR0_EL1);
+ 	info->reg_id_aa64pfr1 = read_cpuid(ID_AA64PFR1_EL1);
+-	info->reg_id_aa64pfr2 = read_cpuid(ID_AA64PFR2_EL1);
++	info->reg_id_aa64pfr2 = read_cpuid_new(ID_AA64PFR2_EL1);
+ 	info->reg_id_aa64zfr0 = read_cpuid(ID_AA64ZFR0_EL1);
+ 	info->reg_id_aa64smfr0 = read_cpuid(ID_AA64SMFR0_EL1);
+-	info->reg_id_aa64fpfr0 = read_cpuid(ID_AA64FPFR0_EL1);
++	info->reg_id_aa64fpfr0 = read_cpuid_new(ID_AA64FPFR0_EL1);
+ 
+ 	if (gmid_el1_accessible(info))
+ 		info->reg_gmid = read_cpuid(GMID_EL1);
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index 22866b4..af114e3 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -539,7 +539,11 @@ alternative_else_nop_endif
+ 	msr	mair_el1, mair
+ 	msr	tcr_el1, tcr
+ 
++#ifdef CONFIG_ARM64_RAZ_NEW_ID_REGS
++	mov	x1, xzr
++#else
+ 	mrs_s	x1, SYS_ID_AA64MMFR3_EL1
++#endif
+ 	ubfx	x1, x1, #ID_AA64MMFR3_EL1_S1PIE_SHIFT, #4
+ 	cbz	x1, .Lskip_indirection
+ 
+@@ -552,7 +556,11 @@ alternative_else_nop_endif
+ 
+ .Lskip_indirection:
+ 
++#ifdef CONFIG_ARM64_RAZ_NEW_ID_REGS
++	mov	x1, xzr
++#else
+ 	mrs_s	x1, SYS_ID_AA64MMFR3_EL1
++#endif
+ 	ubfx	x1, x1, #ID_AA64MMFR3_EL1_TCRX_SHIFT, #4
+ 	cbz	x1, 1f
+ 	msr	REG_TCR2_EL1, tcr2
+-- 
+2.54.0 (Apple Git-157)
+

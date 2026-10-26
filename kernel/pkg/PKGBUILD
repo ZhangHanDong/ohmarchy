@@ -1,0 +1,36 @@
+# Packages the kernel built by oseasy/25-build-kernel-7.2.sh so Omarchy's own boot
+# tooling manages it. limine-mkinitcpio-install builds a UKI and a Limine entry only
+# for /usr/lib/modules/<kver>/ directories a pacman package owns, and finds the
+# image at <kver>/vmlinuz; a kernel copied in by hand is skipped, and Omarchy's
+# first-boot provisioning then replaces limine.conf with entries for the stock
+# kernel, which hangs in the Oseasy VM.
+#
+# Inputs next to this file: Image and modules.tar.gz (usr/lib/modules/<kver>/...),
+# both from $WORK/k72. Build with makepkg as a normal user, install with
+# `pacman -U --overwrite '/usr/lib/modules/<kver>/*'`; it replaces linux-aarch64.
+
+pkgname=linux-ohmarchy-oseasy
+pkgver=7.2.11
+pkgrel=2
+_kver=7.2.11-ohmarchy-ARCH+
+pkgdesc="Arch Linux ARM's linux-aarch64 7.2 with the ohmarchy patches for the HarmonyOS Oseasy VM"
+arch=(aarch64)
+url="https://github.com/ymote/ohmarchy"
+license=(GPL-2.0-only)
+depends=(coreutils kmod mkinitcpio)
+provides=("linux=${pkgver}" "linux-aarch64=${pkgver}" KSMBD-MODULE WIREGUARD-MODULE)
+conflicts=(linux-aarch64)
+options=(!strip !debug)
+source=(Image modules.tar.gz)
+sha256sums=(SKIP SKIP)
+noextract=(modules.tar.gz)
+
+package() {
+  local modules="$pkgdir/usr/lib/modules/$_kver"
+  tar -xzf "$srcdir/modules.tar.gz" -C "$pkgdir"
+  [[ -f $modules/modules.builtin ]] || { echo "modules.tar.gz has no $_kver" >&2; return 1; }
+  install -Dm644 "$srcdir/Image" "$modules/vmlinuz"
+  # mkinitcpio's install hook names the preset and initramfs after pkgbase.
+  echo "$pkgname" > "$modules/pkgbase"
+  rm -f "$modules/.ohmarchy"
+}

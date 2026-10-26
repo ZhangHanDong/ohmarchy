@@ -40,7 +40,28 @@ run_latehook() {
         sed -i 's|^### RULES ###$|### RULES ###\n\n### tuple ### allow any any 0.0.0.0/0 any 172.16.100.0/24 in\n-A ufw-user-input -s 172.16.100.0/24 -j ACCEPT -m comment --comment ohmarchy-oseasy-bridge|' "$U"
     fi
 
-    # 3. Hand the shell over without a gap: a server chrooted into the real root
+    # 3. The Oseasy setup for the installed system (oseasy/root): the patched
+    #    kernel as a package, its boot entries, the disk, per-user settings.
+    if [ -d /ohmarchy-root ]; then
+        mkdir -p "$R/usr/local/libexec" "$S/multi-user.target.wants"
+        cp /ohmarchy-root/ohmarchy-oseasy-setup "$R/usr/local/libexec/ohmarchy-oseasy-setup"
+        chmod 755 "$R/usr/local/libexec/ohmarchy-oseasy-setup"
+        for u in ohmarchy-oseasy-system.service ohmarchy-oseasy-user.service; do
+            cp "/ohmarchy-root/$u" "$S/$u"
+            ln -sf "../$u" "$S/multi-user.target.wants/$u"
+        done
+        # Input for the VM (Caps Lock as SUPER, edge swipes): refreshed on every
+        # boot; the setup enables the units once, so a disabled one stays off.
+        mkdir -p "$R/etc/udev/rules.d"
+        for f in ohmarchy-caps-super ohmarchy-edge-swipe; do
+            cp "/ohmarchy-root/$f" "$R/usr/local/libexec/$f"
+            chmod 755 "$R/usr/local/libexec/$f"
+            cp "/ohmarchy-root/$f.service" "$S/$f.service"
+        done
+        cp /ohmarchy-root/90-ohmarchy-caps-super.rules "$R/etc/udev/rules.d/"
+    fi
+
+    # 4. Hand the shell over without a gap: a server chrooted into the real root
     #    survives switch_root until the systemd unit takes over.
     [ -f /run/omarchy/tcpsvd-initramfs.pid ] && kill "$(cat /run/omarchy/tcpsvd-initramfs.pid)" 2>/dev/null
     sleep 0.3

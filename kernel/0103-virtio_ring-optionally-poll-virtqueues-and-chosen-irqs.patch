@@ -1,0 +1,156 @@
+From b127927e614081b974f732d16cee03691abcad50 Mon Sep 17 00:00:00 2001
+From: ohmarchy <ohmarchy@localhost>
+Date: Sat, 24 Oct 2026 12:08:12 +0800
+Subject: [PATCH] virtio_ring: optionally poll virtqueues and chosen irqs
+
+Under the HarmonyOS PC hypervisor (the Oseasy VM) a v7.2 guest receives no
+device interrupt: virtio requests complete in the used ring, the PCI status
+and GIC show nothing pending, and xhci commands time out. v6.1 gets INTx on
+the same lines; the cause is still open.
+
+virtio_ring.poll_us=<n> polls the used ring of every virtqueue every n
+microseconds from an hrtimer and runs vring_interrupt() for queues with
+work. virtio_ring.poll_irqs=<irq,...> runs the handlers of those Linux irqs
+on the same timer, for non-virtio devices such as xhci. Both are off by
+default.
+---
+ drivers/virtio/virtio_ring.c | 95 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/drivers/virtio/virtio_ring.c b/drivers/virtio/virtio_ring.c
+index b438dc2..3b309cf 100644
+--- a/drivers/virtio/virtio_ring.c
++++ b/drivers/virtio/virtio_ring.c
+@@ -14,6 +14,26 @@
+ #include <linux/kmsan.h>
+ #include <linux/spinlock.h>
+ #include <xen/xen.h>
++#include <linux/irq.h>
++#include <linux/irqdesc.h>
++#include <linux/interrupt.h>
++#include <linux/hrtimer.h>
++
++/*
++ * virtio_ring.poll_us=<n> polls the used ring of every virtqueue every n
++ * microseconds and runs vring_interrupt() for those with work, and
++ * virtio_ring.poll_irqs=<irq,...> runs every handler of those Linux irqs on the
++ * same timer. For hosts that complete requests without raising the interrupt:
++ * under the HarmonyOS PC hypervisor (the Oseasy VM) no device interrupt reaches
++ * a v6.13+ guest. Off by default.
++ */
++static unsigned int poll_us;
++module_param(poll_us, uint, 0444);
++static int poll_irqs[8];
++static int poll_nirqs;
++module_param_array(poll_irqs, int, &poll_nirqs, 0444);
++static void vring_poll_add(struct virtqueue *vq);
++static void vring_poll_del(struct virtqueue *vq);
+ 
+ #ifdef DEBUG
+ /* For development, we want to crash whenever the ring is screwed. */
+@@ -1394,6 +1414,7 @@ static struct virtqueue *__vring_new_virtqueue_split(unsigned int index,
+ 	spin_lock(&vdev->vqs_list_lock);
+ 	list_add_tail(&vq->vq.list, &vdev->vqs);
+ 	spin_unlock(&vdev->vqs_list_lock);
++	vring_poll_add(&vq->vq);
+ 	return &vq->vq;
+ }
+ 
+@@ -2614,6 +2635,7 @@ static struct virtqueue *__vring_new_virtqueue_packed(unsigned int index,
+ 	spin_lock(&vdev->vqs_list_lock);
+ 	list_add_tail(&vq->vq.list, &vdev->vqs);
+ 	spin_unlock(&vdev->vqs_list_lock);
++	vring_poll_add(&vq->vq);
+ 	return &vq->vq;
+ }
+ 
+@@ -3300,6 +3322,78 @@ irqreturn_t vring_interrupt(int irq, void *_vq)
+ }
+ EXPORT_SYMBOL_GPL(vring_interrupt);
+ 
++#define VRING_POLL_MAX 128
++static struct virtqueue *vring_poll_vqs[VRING_POLL_MAX];
++static DEFINE_RAW_SPINLOCK(vring_poll_lock);
++static struct hrtimer vring_poll_timer;
++static bool vring_poll_started;
++
++static enum hrtimer_restart vring_poll_fn(struct hrtimer *t)
++{
++	unsigned long flags;
++	int i;
++
++	raw_spin_lock_irqsave(&vring_poll_lock, flags);
++	for (i = 0; i < VRING_POLL_MAX; i++) {
++		struct virtqueue *vq = vring_poll_vqs[i];
++
++		if (vq && !to_vvq(vq)->broken && more_used(to_vvq(vq)))
++			vring_interrupt(0, vq);
++	}
++	raw_spin_unlock_irqrestore(&vring_poll_lock, flags);
++
++	for (i = 0; i < poll_nirqs; i++) {
++		struct irq_desc *desc = irq_to_desc(poll_irqs[i]);
++		struct irqaction *action;
++
++		if (!desc)
++			continue;
++		for (action = desc->action; action; action = action->next)
++			if (action->handler)
++				action->handler(poll_irqs[i], action->dev_id);
++	}
++
++	hrtimer_forward_now(t, ns_to_ktime((u64)poll_us * NSEC_PER_USEC));
++	return HRTIMER_RESTART;
++}
++
++static void vring_poll_add(struct virtqueue *vq)
++{
++	unsigned long flags;
++	int i;
++
++	if (!poll_us)
++		return;
++	raw_spin_lock_irqsave(&vring_poll_lock, flags);
++	for (i = 0; i < VRING_POLL_MAX; i++) {
++		if (!vring_poll_vqs[i]) {
++			vring_poll_vqs[i] = vq;
++			break;
++		}
++	}
++	raw_spin_unlock_irqrestore(&vring_poll_lock, flags);
++	if (i == VRING_POLL_MAX)
++		pr_warn_once("virtio_ring: more than %d virtqueues, not polling the rest\n", VRING_POLL_MAX);
++	if (!vring_poll_started) {
++		vring_poll_started = true;
++		pr_info("virtio_ring: polling virtqueues every %u us\n", poll_us);
++		hrtimer_setup(&vring_poll_timer, vring_poll_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		hrtimer_start(&vring_poll_timer, ns_to_ktime((u64)poll_us * NSEC_PER_USEC), HRTIMER_MODE_REL);
++	}
++}
++
++static void vring_poll_del(struct virtqueue *vq)
++{
++	unsigned long flags;
++	int i;
++
++	raw_spin_lock_irqsave(&vring_poll_lock, flags);
++	for (i = 0; i < VRING_POLL_MAX; i++)
++		if (vring_poll_vqs[i] == vq)
++			vring_poll_vqs[i] = NULL;
++	raw_spin_unlock_irqrestore(&vring_poll_lock, flags);
++}
++
+ struct virtqueue *vring_create_virtqueue(
+ 	unsigned int index,
+ 	unsigned int num,
+@@ -3517,6 +3611,7 @@ void vring_del_virtqueue(struct virtqueue *_vq)
+ {
+ 	struct vring_virtqueue *vq = to_vvq(_vq);
+ 
++	vring_poll_del(_vq);
+ 	spin_lock(&vq->vq.vdev->vqs_list_lock);
+ 	list_del(&_vq->list);
+ 	spin_unlock(&vq->vq.vdev->vqs_list_lock);
+-- 
+2.54.0 (Apple Git-157)
+

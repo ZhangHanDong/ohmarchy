@@ -1,0 +1,34 @@
+From b6e590330321bd04ba41f0fb2137d1f061aa16a3 Mon Sep 17 00:00:00 2001
+From: AlexZhang <blackanger.z@gmail.com>
+Date: Mon, 26 Oct 2026 09:58:58 +0800
+Subject: [PATCH] drm: don't require an EGL renderer on firmware framebuffers
+
+simpledrm, efidrm, vesadrm and ofdrm expose KMS without a render node,
+so CDRMRenderer::attempt never finds an EGL device for them. Like evdi,
+they then retried initMgpu on every commit: reopen the node, create a GBM
+device, scan the EGL devices, fail, and log four errors per frame.
+---
+ src/backend/drm/DRM.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index 431247b..11298de 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -1119,7 +1119,12 @@ bool Aquamarine::CDRMBackend::registerGPU(SP<CSessionDevice> gpu_, SP<CDRMBacken
+ 
+     auto drmVerName = drmVer && drmVer->name ? drmVer->name : "unknown";
+     driver          = driverFromName(drmVerName);
+-    if (driver == AQ_BACKEND_GPU_DRIVER_EVDI) {
++    // Firmware framebuffers have no render node and no EGL device either. With
++    // rendererRequired, every commit retries initMgpu, which reopens the node,
++    // creates a GBM device and scans the EGL devices before failing again.
++    const std::string_view verName    = drmVerName;
++    const bool             firmwareFB = verName == "simpledrm" || verName == "efidrm" || verName == "vesadrm" || verName == "ofdrm";
++    if (driver == AQ_BACKEND_GPU_DRIVER_EVDI || firmwareFB) {
+         // DisplayLink/evdi exposes KMS without a usable EGL renderer.
+         primary          = {};
+         rendererRequired = false;
+-- 
+2.54.0 (Apple Git-157)
+

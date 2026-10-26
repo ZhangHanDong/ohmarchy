@@ -10,12 +10,15 @@ set -euo pipefail
 module_dir=$(realpath -e -- "$1")
 llvm_dir=$(dirname "$(command -v "$CLANG")")
 ver=$("$CLANG" -dumpversion); maj=${ver%%.*}; rest=${ver#*.}; min=${rest%%.*}
+# clang 16 dropped -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang,
+# which this flag adds; -ftrivial-auto-var-init=zero alone works from then on.
+enabler=; [ "$maj" -lt 16 ] && enabler=y
 exec make -C "$HEADERS" -f "$COMMON/Makefile" \
     srctree="$COMMON" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     CC="$CLANG --target=aarch64-linux-gnu" LLVM="$llvm_dir/" \
     CONFIG_CC_IS_GCC= CONFIG_CC_IS_CLANG=y \
     CONFIG_GCC_VERSION=0 CONFIG_CLANG_VERSION=$((maj * 10000 + min * 100)) \
     CONFIG_CC_IMPLICIT_FALLTHROUGH=-Wimplicit-fallthrough \
-    CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER=y \
+    CONFIG_CC_HAS_AUTO_VAR_INIT_ZERO_ENABLER=$enabler \
     DEBIAN_KERNEL_NO_CC_VERSION_CHECK= \
     M="$module_dir" -j"$(nproc)" modules

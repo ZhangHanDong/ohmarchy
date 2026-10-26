@@ -1,0 +1,12 @@
+# Merged over Arch Linux ARM's linux-aarch64 config by kernel/build-in-container.sh.
+
+# Read the ID registers added after v6.1 as zero (0100-*.patch): the HarmonyOS
+# hypervisor injects an undefined instruction for them, and v6.5+ hangs early.
+CONFIG_ARM64_RAZ_NEW_ID_REGS=y
+
+# KMS on the EFI GOP framebuffer, which the Oseasy VM keeps in its SVGA VRAM:
+# the upstream counterpart of driver/efidrm, so Hyprland gets a card0.
+CONFIG_DRM_EFIDRM=y
+# efifb would claim the same framebuffer first; efidrm's fbdev emulation
+# provides the console instead.
+# CONFIG_FB_EFI is not set

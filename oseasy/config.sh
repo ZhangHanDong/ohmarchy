@@ -14,6 +14,23 @@ OHMARCHY_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${KBUILD_SERIES:=6.1}"
 : "${DEBIAN_MIRROR:=https://deb.debian.org/debian}"
 
+# Patched 7.2 kernel (oseasy/25-build-kernel-7.2.sh, kernel/): Arch Linux ARM's
+# linux-aarch64 plus kernel/0100-*.patch, which reads the ID registers added
+# after v6.1 as zero. The hypervisor injects an undefined instruction for them,
+# which is what hangs every kernel >= 6.5 here. The desktop needs it;
+# 40-build-boot.sh adds its boot entries only when $WORK/k72 exists.
+: "${K72_VER:=7.2.11}"
+: "${K72_SERIES:=7.2}"
+: "${ALARM_PKGBUILDS_COMMIT:=b7704835b2a0fd85b77eb7bc873d0a865e3e984b}"  # core/linux-aarch64 7.2.11-1
+: "${K72_LOCALVERSION:=-ohmarchy}"                                       # uname -r: 7.2.11-ohmarchy-ARCH
+: "${KERNEL_BUILD_IMAGE:=debian:trixie}"                                 # container that builds it
+: "${DOCKER:=docker}"
+# Under 7.2 no device in this VM raises an interrupt (cause still open; see
+# docs/findings.md), so the 7.2 entries poll: every virtqueue, and the handlers
+# of Linux irq 15 (xhci: keyboard and tablet), every millisecond. Needs the
+# polling patch in the kernel (kernel/0103).
+: "${K72_CMDLINE_EXTRA:=virtio_ring.poll_us=1000 virtio_ring.poll_irqs=15}"
+
 # The installer ISO is only a carrier: Oseasy boots installer media, and the
 # Debian rescue shell writes the Omarchy disk image to the VM disk.
 : "${NETINST_URL:=https://cdimage.debian.org/cdimage/archive/12.15.0/arm64/iso-cd/debian-12.15.0-arm64-netinst.iso}"

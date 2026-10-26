@@ -45,6 +45,25 @@ HarmonyOS 7.0). Each was observed on the device unless marked otherwise.
 
 - Kernels >= 6.5 hang early in this VM (Omarchy's 7.2.3, a community report
   covering 6.5 and 6.12). Debian's 6.1.0-50 boots.
+- Cause: the community report bisected the hang to edc25898f0b6 ("arm64:
+  cpufeature: add system register ID_AA64MMFR3_EL1", v6.5). The architecture
+  requires unallocated ID registers to read as zero, but this hypervisor injects
+  an undefined instruction instead. v6.5 reads ID_AA64MMFR3_EL1 in
+  `__cpu_setup`, with the MMU off and before any console, hence the silent early
+  hang. 7.2 reads five ID registers that 6.1 never touches (MMFR3, MMFR4, PFR2,
+  FPFR0, ISAR3), in `__cpu_setup`, `__cpuinfo_store_cpu()` and
+  `__read_sysreg_by_encoding()`. With `kernel/0100-*.patch`, which reads them as
+  zero, 7.2.11 boots; the unpatched kernel with earlycon prints nothing.
+- StratoVirt freezes the VM when the guest writes zero to the virtio-pci
+  extended feature words 2 and 3, which 7.2 does and 6.1 does not
+  (`kernel/0101`).
+- Under 7.2 no device in this VM raises an interrupt: the virtio ISR reads 0,
+  the PCI status shows no INTx, the GIC SPI is enabled and never pending, and
+  xhci commands time out. 6.1 gets INTx on the same SPIs. The cause is still
+  open (`kernel/0102`, the GIC priority, is not it). `kernel/0103` polls instead:
+  `virtio_ring.poll_us=1000` runs every virtqueue's callback from an hrtimer and
+  `virtio_ring.poll_irqs=15` the handlers of Linux irq 15 (xhci: keyboard and
+  tablet), every millisecond. With that, the whole desktop works.
 - Debian 6.1 arm64 has neither `CONFIG_SYSFB_SIMPLEFB` nor simpledrm, so the
   only KMS options are the SVGA driver or `driver/efidrm`.
 - Omarchy's root on a foreign kernel needs that kernel's modules. Without them
@@ -52,6 +71,65 @@ HarmonyOS 7.0). Each was observed on the device unless marked otherwise.
   installs the 6.1 modules on first boot.
 - busybox chooses the applet from its file name, so a copy named anything other
   than `busybox` fails with "applet not found".
+
+## Display (7.2, efidrm)
+
+- The UEFI GOP offers a single mode, 800x600. Limine's `resolution:` (tried
+  1600x1200 and 1024x768) falls back to it, so efidrm, and Hyprland, run at
+  800x600@60; Oseasy scales that to the window.
+- Hyprland renders with llvmpipe on 6 vCPUs. Light work reaches 60 commits a
+  second on about two cores; animations, blur and shadows cost the most, so the
+  setup turns them off (Omarchy's own VM flag, which the image predates).
+- aquamarine needs an EGL renderer on every DRM device unless it is evdi. A
+  firmware framebuffer has none, so it retried `initMgpu` on every commit,
+  reopening the node, creating a GBM device and scanning EGL devices before
+  failing again, with four errors in the log per frame (tens of MB an hour, in
+  `/run/user`). `oseasy/aquamarine/0001-*.patch` treats firmware framebuffers
+  like evdi.
+- Ghosting (windows that stay after closing, trails around the pointer): the
+  framebuffer memory itself held half-drawn frames. Dumping VRAM (BAR1 of the
+  SVGA device, through `/sys/bus/pci/devices/0000:00:04.0/resource1`) showed the
+  stale part with the staircase edge of llvmpipe's 64x64 tiles, while `grim`
+  showed the finished frame; writing to VRAM directly shows up at once. Hyprland
+  calls `glFinish` before a commit only on a software renderer, which it detects
+  from the DRM driver's name, and efidrm is not on its list. Without explicit
+  sync (llvmpipe has no native fence) it ends the frame with `glFlush`, which
+  llvmpipe does not wait on. A single commit, like closing a window, then leaves
+  the half-drawn frame on screen until the next one. `oseasy/extras/glfinish.c`
+  works around it; `oseasy/hyprland/0001-*.patch` is the fix for upstream. The
+  faster patched aquamarine made it worse only because it commits sooner.
+
+## Input
+
+- Oseasy passes the HarmonyOS keyboard as a USB keyboard. HarmonyOS keeps its own
+  Caps Lock, Num Lock and Scroll Lock state and compares it with the guest's
+  LEDs; when they differ it wraps every key in an extra press and release of the
+  lock key, 1 to 3 ms long. An XKB remap such as `caps:super` never toggles the
+  LED, so after one press every key comes wrapped, which also releases a held
+  Caps Lock. The compositor sets the LEDs from its own XKB state, so it has to
+  be kept off the real keyboard (`oseasy/root/ohmarchy-caps-super`).
+- HarmonyOS keeps some shortcuts: SUPER reaches the guest, but the L of SUPER + L
+  does not.
+- Touches on the HarmonyOS screen arrive as a single absolute pointer (the USB
+  tablet), however many fingers: no multi-finger gesture can be seen in the
+  guest.
+- The touchpad arrives as "StratoVirt Virtio Multitouch", which libinput takes
+  for a touchpad (POINTER and BUTTONPAD), with three slots: three-finger swipes
+  work, four fingers never arrive. Two fingers are scrolling, and Hyprland's
+  scroll binds (`mouse_left`/`mouse_right`) react to wheels only, not to finger
+  scrolling.
+
+## Packages and network
+
+- The image's package databases date from the image build; the Arch Linux ARM
+  mirrors, Tsinghua's included, keep only current versions, so packages new to
+  the image have to come from a current database. Installing one from it is a
+  partial upgrade: fcitx5-qt from a current database, for example, is built for
+  a newer Qt than the image has, and Qt's input method plugin needs the exact Qt.
+- github.com is unreachable from the VM in China, and the image's Omarchy
+  repository is GitHub releases (`riverscn/omarchy-pkgs-aarch64`), so
+  `omarchy-update` stops at syncing it. Tsinghua's Arch Linux ARM mirror is
+  fast; the original and Omarchy's arm-mirror are slow.
 
 ## Host link
 

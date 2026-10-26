@@ -1,0 +1,347 @@
+#!/bin/bash
+# ohmarchy-oseasy-setup system|user|grow-root: adapt an installed Omarchy root to
+# the Oseasy VM. Installed by the initramfs late hook (oseasy/initramfs/hooks/
+# omarchy-late) and run by ohmarchy-oseasy-system.service (before Omarchy's
+# first-boot provisioning) and ohmarchy-oseasy-user.service (after it, before
+# the login screen). Every step is idempotent; both units run on every boot.
+set -euo pipefail
+
+ESP=/boot
+KVER=7.2.11-ohmarchy-ARCH+
+POLL_CMDLINE="virtio_ring.poll_us=1000 virtio_ring.poll_irqs=15"
+OMARCHY_DEFAULT=/usr/share/omarchy/default
+EXTRAS=$ESP/ohmarchy/extras
+GLFINISH=/usr/local/lib/ohmarchy-glfinish.so
+STATE=/var/lib/ohmarchy-oseasy
+# Arch Linux ARM's own mirror is slow from China, where HarmonyOS PCs are sold;
+# Tsinghua's mirror comes first and the original stays as the fallback.
+ALARM_MIRRORS=('https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm/$arch/$repo'
+               'http://mirror.archlinuxarm.org/$arch/$repo')
+INPUT_UNITS=(ohmarchy-caps-super.service ohmarchy-edge-swipe.service)
+
+log() { echo "ohmarchy-oseasy-setup: $*"; }
+
+# The patched 7.2 kernel as a pacman package, so Omarchy's limine-update builds
+# the default boot entry from it. Omarchy's provisioning starts limine.conf over
+# from its template and rebuilds entries only for packaged kernels; without this
+# the next boot is the stock kernel, which hangs in this VM.
+install_kernel() {
+  local pkg want
+  pkg=$(ls "$ESP"/ohmarchy/linux-ohmarchy-oseasy-*.pkg.tar.* 2>/dev/null | sort -V | tail -1 || true)
+  [[ -n $pkg ]] || return 0
+  want=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgver = //p')
+  [[ $(pacman -Q linux-ohmarchy-oseasy 2>/dev/null | cut -d' ' -f2) == "$want" ]] && return 0
+  log "installing $(basename "$pkg")"
+  # pacman's kernel hooks run limine-update, which builds the entry with the
+  # drop-in below, so kernel_cmdline runs first.
+  pacman -U --noconfirm --ask 4 --overwrite "/usr/lib/modules/$KVER/*" "$pkg"
+  REBUILT=1
+}
+
+# Under 7.2 no device in this VM raises an interrupt: the kernel polls virtqueues
+# and irq 15 (xhci) instead. limine-entry-tool adds this to every kernel entry.
+kernel_cmdline() {
+  local conf=/etc/limine-entry-tool.d/90-ohmarchy-oseasy.conf
+  local line="KERNEL_CMDLINE[default]+=\" $POLL_CMDLINE\""
+  [[ -f $conf ]] && grep -qxF "$line" "$conf" && return 0
+  printf '# ohmarchy (Oseasy VM): no device interrupt reaches the 7.2 kernel here, so it polls.\n%s\n' "$line" > "$conf"
+  log "kernel command line drop-in written"
+  CMDLINE_CHANGED=1
+}
+
+# aquamarine with oseasy/aquamarine/0001-*.patch: on efidrm the stock one retries
+# its EGL renderer on every frame and logs four errors each time. The package is
+# built for one upstream version (pkgrel N.1); install it only over that exact
+# version, never over a newer one that an update brought in.
+install_aquamarine() {
+  local pkg want have
+  pkg=$(ls "$ESP"/ohmarchy/aquamarine-*.pkg.tar.* 2>/dev/null | sort -V | tail -1 || true)
+  [[ -n $pkg ]] || return 0
+  want=$(bsdtar -xOf "$pkg" .PKGINFO | sed -n 's/^pkgver = //p')
+  have=$(pacman -Q aquamarine 2>/dev/null | cut -d' ' -f2)
+  [[ $have == "${want%.1}" ]] || return 0
+  log "installing $(basename "$pkg")"
+  pacman -U --noconfirm "$pkg" >/dev/null
+}
+
+# Hyprland decides it renders in software from the DRM driver's name, and on
+# efidrm it takes llvmpipe for a GPU: it commits frames llvmpipe has not finished
+# drawing, and what is left of the old frame stays on screen. glfinish.c makes
+# its glFlush wait. The session's Hyprland gets it in session_preload; the
+# greeter runs its own Hyprland, so its compositor command gets it here.
+install_glfinish() {
+  local conf=/etc/sddm.conf.d/20-ohmarchy-glfinish.conf cmd
+  [[ -f $EXTRAS/ohmarchy-glfinish.so ]] || return 0
+  cmp -s "$EXTRAS/ohmarchy-glfinish.so" "$GLFINISH" || install -m 755 "$EXTRAS/ohmarchy-glfinish.so" "$GLFINISH"
+  [[ -f $conf ]] && return 0
+  cmd=$(sed -n 's/^CompositorCommand=//p' /etc/sddm.conf.d/10-wayland.conf 2>/dev/null)
+  [[ -n $cmd ]] || return 0
+  printf '# ohmarchy (Oseasy VM): the greeter'"'"'s Hyprland waits for llvmpipe too (ohmarchy-glfinish.so).\n[Wayland]\nCompositorCommand=env LD_PRELOAD=%s %s\n' "$GLFINISH" "$cmd" > "$conf"
+  log "greeter preloads $GLFINISH"
+}
+
+alarm_mirrors() {
+  local list=/etc/pacman.d/mirrorlist
+  grep -q '^# ohmarchy-oseasy' "$list" 2>/dev/null && return 0
+  [[ -f $list ]] && cp "$list" "$list.ohmarchy-orig"
+  { echo "# ohmarchy-oseasy: Tsinghua first, Arch Linux ARM's mirror as the fallback ($list.ohmarchy-orig is the original)."
+    printf 'Server = %s\n' "${ALARM_MIRRORS[@]}"; } > "$list"
+  log "pacman mirrors: Tsinghua first"
+}
+
+# The Pinyin input method (28-build-extras.sh fetched the packages the image
+# lacks). It is skipped once installed, and when an update brought a newer
+# fcitx5 than the one shipped, which the shipped engine would downgrade.
+install_pinyin() {
+  local pkgs=() f shipped="" have
+  pacman -Q fcitx5-chinese-addons >/dev/null 2>&1 && return 0
+  for f in "$EXTRAS"/pkgs/*.pkg.tar.*; do
+    [[ -f $f && $f != *.sig ]] || continue
+    pkgs+=("$f")
+    [[ $(basename "$f") == fcitx5-[0-9]* ]] && shipped=$f
+  done
+  (( ${#pkgs[@]} )) || return 0
+  if [[ -n $shipped ]]; then
+    have=$(pacman -Q fcitx5 2>/dev/null | cut -d' ' -f2)
+    if [[ -n $have ]] && (( $(vercmp "$have" "$(bsdtar -xOf "$shipped" .PKGINFO | sed -n 's/^pkgver = //p')") > 0 )); then
+      log "Pinyin: fcitx5 $have is newer than the shipped engine's; install fcitx5-chinese-addons from the mirror"
+      return 0
+    fi
+  fi
+  log "installing the Pinyin input method"
+  pacman -U --noconfirm --needed "${pkgs[@]}" >/dev/null || log "Pinyin: install failed"
+}
+
+# Enabled once: a unit the user turns off stays off (the late hook refreshes the
+# files on every boot).
+enable_input() {
+  local unit
+  mkdir -p "$STATE"
+  for unit in "${INPUT_UNITS[@]}"; do
+    [[ -e $STATE/enabled-$unit || ! -f /etc/systemd/system/$unit ]] && continue
+    systemctl enable --now --no-block "$unit" >/dev/null 2>&1 || log "could not enable $unit"
+    touch "$STATE/enabled-$unit"
+    log "enabled $unit"
+  done
+}
+
+rebuild_entries() {
+  if [[ -n ${CMDLINE_CHANGED:-} && -z ${REBUILT:-} ]] && pacman -Q linux-ohmarchy-oseasy >/dev/null 2>&1; then
+    log "rebuilding boot entries"
+    limine-update >/dev/null 2>&1 || log "limine-update failed"
+  fi
+}
+
+# The image comes from a UTM build that mounts a 9p host share; Oseasy has none.
+mask_hostshare() {
+  if [[ ! -L /etc/systemd/system/mnt-hostshare.mount ]]; then
+    systemctl mask mnt-hostshare.mount >/dev/null 2>&1 || true
+    systemctl reset-failed mnt-hostshare.mount 2>/dev/null || true
+  fi
+}
+
+# The image's grow-root uses `parted resizepart`, which refuses the mounted root
+# even with --script. Grow it with sfdisk instead: move the backup GPT to the end
+# of the disk, extend the partition in place, tell the kernel, resize btrfs.
+grow_root() {
+  local part disk n disk_size part_size part_start remaining
+  part=$(readlink -f "$(findmnt -nro SOURCE / | sed 's/\[.*//')")
+  [[ -b $part ]] || return 0
+  n=$(lsblk -nro PARTN "$part" | head -1)
+  disk=/dev/$(lsblk -nro PKNAME "$part" | head -1)
+  [[ $n =~ ^[0-9]+$ && -b $disk ]] || return 0
+  disk_size=$(lsblk -bdnro SIZE "$disk")
+  part_size=$(lsblk -bdnro SIZE "$part")
+  part_start=$(lsblk -dnro START "$part")
+  remaining=$((disk_size - part_start * 512 - part_size))
+  if (( remaining > 16 * 1024 * 1024 )); then
+    log "growing $part by $((remaining / 1024 / 1024)) MiB"
+    sfdisk --relocate gpt-bak-std "$disk"
+    echo ', +' | sfdisk --no-reread --no-tell-kernel --force -N "$n" "$disk"
+    partx -u -n "$n" "$disk"
+  fi
+  btrfs filesystem resize max / >/dev/null
+}
+
+grow_root_override() {
+  local dir=/etc/systemd/system/omarchy-aarch64-grow-root.service.d
+  [[ -f $dir/ohmarchy.conf ]] && return 0
+  mkdir -p "$dir"
+  printf '[Service]\nExecStart=\nExecStart=/usr/local/libexec/ohmarchy-oseasy-setup grow-root\n' > "$dir/ohmarchy.conf"
+  systemctl daemon-reload
+  systemctl reset-failed omarchy-aarch64-grow-root.service 2>/dev/null || true
+}
+
+# Everything here renders on the CPU (llvmpipe): every animation frame redraws
+# the screen on 2-3 cores. Current Omarchy starts a VM without animations, blur
+# and shadows (install/user/hardware/vm-no-animations.sh); the image's Omarchy
+# predates that, and has the toggles directory but not the flag. Place the same
+# flag, under the same name so a later `omarchy toggle animations` sees it, once
+# per user: the marker keeps turning them back on the user's choice.
+vm_look() {
+  local home user toggles marker
+  for home in /home/*; do
+    [[ -d $home/.config/hypr ]] || continue
+    user=$(stat -c %U "$home")
+    toggles=$home/.local/state/omarchy/toggles/hypr
+    marker=$home/.local/state/ohmarchy-oseasy/vm-look
+    [[ -e $marker ]] && continue
+    runuser -u "$user" -- mkdir -p "$toggles" "$(dirname "$marker")"
+    if [[ -f $OMARCHY_DEFAULT/hypr/toggles/no-animations.lua ]]; then
+      runuser -u "$user" -- cp "$OMARCHY_DEFAULT/hypr/toggles/no-animations.lua" "$toggles/"
+    else
+      runuser -u "$user" -- tee "$toggles/no-animations.lua" >/dev/null <<'FLAG'
+-- Draw nothing just for show, for machines that render on the CPU, like a VM:
+-- no animations, blur or shadows.
+hl.config({
+  animations = {
+    enabled = false,
+  },
+
+  decoration = {
+    blur = {
+      enabled = false,
+    },
+
+    shadow = {
+      enabled = false,
+    },
+  },
+})
+FLAG
+    fi
+    runuser -u "$user" -- touch "$marker"
+    log "animations, blur and shadows turned off for $user"
+  done
+}
+
+# The session's Hyprland (uwsm's unit) preloads ohmarchy-glfinish.so (see
+# install_glfinish).
+session_preload() {
+  local home user dir
+  [[ -f $GLFINISH ]] || return 0
+  for home in /home/*; do
+    [[ -d $home/.config/hypr ]] || continue
+    user=$(stat -c %U "$home")
+    dir=$home/.config/systemd/user/wayland-wm@hyprland.desktop.service.d
+    [[ -f $dir/ohmarchy-glfinish.conf ]] && continue
+    runuser -u "$user" -- mkdir -p "$dir"
+    printf '[Service]\n# ohmarchy (Oseasy VM): Hyprland takes llvmpipe on efidrm for a GPU; glFlush waits for it here.\nEnvironment=LD_PRELOAD=%s\n' "$GLFINISH" |
+      runuser -u "$user" -- tee "$dir/ohmarchy-glfinish.conf" >/dev/null
+    log "Hyprland preloads $GLFINISH for $user"
+  done
+}
+
+# Input for the VM, once per user like vm_look, as a toggle that Hyprland loads
+# after the user's config.
+vm_input() {
+  local home user toggles marker
+  for home in /home/*; do
+    [[ -d $home/.config/hypr ]] || continue
+    user=$(stat -c %U "$home")
+    toggles=$home/.local/state/omarchy/toggles/hypr
+    marker=$home/.local/state/ohmarchy-oseasy/vm-input
+    [[ -e $marker ]] && continue
+    runuser -u "$user" -- mkdir -p "$toggles" "$(dirname "$marker")"
+    runuser -u "$user" -- tee "$toggles/ohmarchy-oseasy-input.lua" >/dev/null <<'INPUT'
+-- ohmarchy (Oseasy VM) input.
+--
+-- Caps Lock arrives as SUPER (ohmarchy-caps-super, because HarmonyOS keeps some
+-- SUPER shortcuts such as SUPER + L), so Right Alt takes over compose.
+--
+-- The touchpad reports at most three fingers, and two fingers are scrolling
+-- (Hyprland binds react to wheels only). Three fingers left/right switch
+-- workspaces, empty ones included; SUPER + three fingers move between the
+-- windows of the scrolling layout. Touches on the screen reach the VM as a single
+-- pointer: ohmarchy-edge-swipe turns edge swipes into the same moves.
+hl.config({
+  input = {
+    kb_options = "compose:ralt,shift:both_capslock_cancel",
+  },
+
+  gestures = {
+    workspace_swipe_use_r = true,
+  },
+})
+
+hl.gesture({ fingers = 3, direction = "horizontal", action = "workspace" })
+hl.gesture({ fingers = 3, direction = "horizontal", mods = "SUPER", action = "scroll_move" })
+INPUT
+    runuser -u "$user" -- touch "$marker"
+    log "VM input (Caps Lock as SUPER, compose, gestures) set up for $user"
+  done
+}
+
+# Pinyin in each user's Fcitx input group, and Simplified Chinese glyphs for CJK
+# text (Omarchy's own CJK font preference file), once per user. The user step
+# runs before the session, so Fcitx is not running to rewrite its profile.
+pinyin_profile() {
+  local home user profile fonts marker items
+  pacman -Q fcitx5-chinese-addons >/dev/null 2>&1 || return 0
+  for home in /home/*; do
+    [[ -d $home/.config/hypr ]] || continue
+    user=$(stat -c %U "$home")
+    profile=$home/.config/fcitx5/profile
+    fonts=$home/.config/fontconfig/conf.d/50-omarchy-input-method.conf
+    marker=$home/.local/state/ohmarchy-oseasy/pinyin
+    [[ -e $marker ]] && continue
+    runuser -u "$user" -- mkdir -p "$(dirname "$profile")" "$(dirname "$fonts")" "$(dirname "$marker")"
+    if [[ ! -f $profile ]]; then
+      printf '[Groups/0]\nName=Default\nDefault Layout=us\nDefaultIM=keyboard-us\n\n[Groups/0/Items/0]\nName=keyboard-us\nLayout=\n\n[GroupOrder]\n0=Default\n' |
+        runuser -u "$user" -- tee "$profile" >/dev/null
+    fi
+    if ! grep -qx 'Name=pinyin' "$profile"; then
+      items=$(grep -c '^\[Groups/0/Items/' "$profile" || true)
+      runuser -u "$user" -- sed -i "s|^\[GroupOrder\]$|[Groups/0/Items/$items]\nName=pinyin\nLayout=\n\n[GroupOrder]|" "$profile"
+    fi
+    if [[ ! -e $fonts ]]; then
+      runuser -u "$user" -- tee "$fonts" >/dev/null <<'FONTS'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+<alias><family>sans-serif</family><accept><family>Noto Sans CJK SC</family></accept></alias>
+<alias><family>Liberation Sans</family><accept><family>Noto Sans CJK SC</family></accept></alias>
+<alias><family>serif</family><accept><family>Noto Serif CJK SC</family></accept></alias>
+<alias><family>Liberation Serif</family><accept><family>Noto Serif CJK SC</family></accept></alias>
+<alias><family>monospace</family><accept><family>Noto Sans Mono CJK SC</family></accept></alias>
+<alias><family>JetBrainsMono Nerd Font</family><accept><family>Noto Sans Mono CJK SC</family></accept></alias>
+</fontconfig>
+FONTS
+    fi
+    runuser -u "$user" -- touch "$marker"
+    log "Pinyin and Simplified Chinese glyphs set up for $user (Ctrl + Space switches)"
+  done
+}
+
+# Omarchy's provisioning starts limine.conf over from its template, which drops
+# ohmarchy's prebuilt entries. Put them back at the end; limine-update keeps
+# entries it did not generate.
+fallback_entries() {
+  local conf=$ESP/limine.conf
+  [[ -f $conf && -f $ESP/EFI/Linux/ohmarchy-7.2.efi ]] || return 0
+  grep -q '^/ohmarchy  7.2' "$conf" && return 0
+  cat >> "$conf" <<'ENTRIES'
+
+# ohmarchy (Oseasy VM) fallbacks, kept by limine-update: prebuilt UKIs with the
+# initramfs network shell on 172.16.100.2:5000.
+/ohmarchy  7.2, initramfs network shell
+protocol: efi
+path: boot():/EFI/Linux/ohmarchy-7.2.efi
+
+/ohmarchy  7.2, earlycon (debug)
+protocol: efi
+path: boot():/EFI/Linux/ohmarchy-7.2-earlycon.efi
+
+/ohmarchy  6.1 kernel, EFI framebuffer (no desktop)
+protocol: efi
+path: boot():/EFI/Linux/ohmarchy-6.1.efi
+ENTRIES
+  log "ohmarchy fallback entries added to $conf"
+}
+
+case "${1:-}" in
+  system) kernel_cmdline; install_kernel; rebuild_entries; install_aquamarine; install_glfinish; alarm_mirrors; install_pinyin; enable_input; mask_hostshare; grow_root_override; grow_root ;;
+  user) vm_look; vm_input; session_preload; pinyin_profile; fallback_entries ;;
+  grow-root) grow_root ;;
+  *) echo "usage: $0 system|user|grow-root" >&2; exit 2 ;;
+esac

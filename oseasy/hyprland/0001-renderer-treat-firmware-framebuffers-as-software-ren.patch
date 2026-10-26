@@ -1,0 +1,54 @@
+From 895cc8a220f9699be0da485fb10c95d7fc9c893d Mon Sep 17 00:00:00 2001
+From: AlexZhang <blackanger.z@gmail.com>
+Date: Mon, 26 Oct 2026 18:30:47 +0800
+Subject: [PATCH] renderer: treat firmware framebuffers as software rendering
+
+On simpledrm, efidrm, vesadrm and ofdrm the only renderer is a software one
+(llvmpipe), but the DRM driver name does not say so, and Hyprland takes it for
+a GPU. Without explicit sync it then ends a frame with glFlush, which llvmpipe
+does not wait on, and commits a buffer that is still being drawn: the parts not
+yet drawn keep the previous frame on screen until the next one (closing a
+window often leaves it in place). Treat these drivers like llvmpipe, so the
+frame ends with glFinish.
+---
+ src/render/Renderer.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/render/Renderer.cpp b/src/render/Renderer.cpp
+index 057f1cd..2bc8f14 100644
+--- a/src/render/Renderer.cpp
++++ b/src/render/Renderer.cpp
+@@ -86,6 +86,12 @@ static int cursorTicker(void* data) {
+     return 0;
+ }
+ 
++// Firmware framebuffers (simpledrm, efidrm, vesadrm, ofdrm) have no GPU behind
++// them, so whatever renders for them renders in software.
++static bool isFirmwareFramebuffer(const std::string& name) {
++    return name == "simpledrm" || name == "efidrm" || name == "vesadrm" || name == "ofdrm";
++}
++
+ IHyprRenderer::IHyprRenderer() {
+     m_globalTimer.reset();
+     pushMonitorTransformEnabled(false);
+@@ -104,7 +110,7 @@ IHyprRenderer::IHyprRenderer() {
+                 m_nvidia = true;
+             else if (name.contains("i915"))
+                 m_intel = true;
+-            else if (name.contains("softpipe") || name.contains("Software Rasterizer") || name.contains("llvmpipe"))
++            else if (name.contains("softpipe") || name.contains("Software Rasterizer") || name.contains("llvmpipe") || isFirmwareFramebuffer(name))
+                 m_software = true;
+ 
+             Log::logger->log(Log::DEBUG, "DRM driver information: {} v{}.{}.{} from {} description {}", name, DRMV->version_major, DRMV->version_minor, DRMV->version_patchlevel,
+@@ -126,7 +132,7 @@ IHyprRenderer::IHyprRenderer() {
+                 m_nvidia = true;
+             else if (name.contains("i915"))
+                 m_intel = true;
+-            else if (name.contains("softpipe") || name.contains("Software Rasterizer") || name.contains("llvmpipe"))
++            else if (name.contains("softpipe") || name.contains("Software Rasterizer") || name.contains("llvmpipe") || isFirmwareFramebuffer(name))
+                 m_software = true;
+ 
+             Log::logger->log(Log::DEBUG, "Primary DRM driver information: {} v{}.{}.{} from {} description {}", name, DRMV->version_major, DRMV->version_minor,
+-- 
+2.54.0 (Apple Git-157)
+

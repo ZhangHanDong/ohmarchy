@@ -1,0 +1,144 @@
+#!/usr/bin/python3
+# ohmarchy-caps-super [--release]: Caps Lock as SUPER on the Oseasy VM keyboard.
+#
+# HarmonyOS keeps its own Caps Lock, Num Lock and Scroll Lock state, toggled by
+# each press of those keys, and compares it with the LEDs the guest sets. When
+# they differ it wraps every key in an extra press and release of the lock key,
+# which also releases a held Caps Lock. An XKB remap (caps:super) never toggles
+# the LED, so the two drift apart after one press.
+#
+# This grabs the keyboard and sends its keys on through a virtual keyboard, with
+# Caps Lock as Right Super (Left Super stays the Windows key). It toggles the
+# real keyboard's LED on each lock key press, so the state HarmonyOS sees stays
+# in step. The presses HarmonyOS adds last a millisecond or two, where a hand
+# takes tens: those are dropped, and the first of a burst corrects the LED (the
+# LED reaches the host late, so it adds a second one before it sees the first
+# correction).
+#
+# While this runs, the real keyboard is hidden from libinput (FLAG below and
+# 90-ohmarchy-caps-super.rules); otherwise the compositor would set its LEDs
+# from the virtual keyboard's state. --release (the unit's ExecStopPost) hands it
+# back, so the keyboard works directly whenever this is not running.
+import fcntl
+import glob
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+
+EV_SYN, EV_KEY, EV_LED = 0, 1, 17
+KEY_CAPSLOCK, KEY_RIGHTMETA = 58, 126
+LOCK_LEDS = {58: 1, 69: 0, 70: 2}  # Caps Lock, Num Lock, Scroll Lock
+TAP_SECONDS = 0.015  # an added press is released within this
+SETTLE_SECONDS = 0.3  # a burst of added presses is one correction
+FLAG = "/run/ohmarchy/caps-super"
+EVENT = struct.Struct("qqHHi")
+EVIOCGRAB = 0x40044590
+EVIOCGLED = 0x80084519
+UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
+UI_DEV_SETUP, UI_DEV_CREATE = 0x405c5503, 0x5501
+
+
+def find_keyboard():
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            name = open(path + "/device/name").read().strip()
+        except OSError:
+            continue
+        if name == "StratoVirt StratoVirt USB Keyboard":
+            return "/dev/input/" + os.path.basename(path)
+    return None
+
+
+def replug(device):
+    # libinput reads the udev properties only when a device appears.
+    sys_path = "/sys/class/input/" + os.path.basename(device)
+    for action in ("remove", "add"):
+        subprocess.run(["udevadm", "trigger", "--action=" + action, sys_path], check=False)
+    subprocess.run(["udevadm", "settle"], check=False)
+
+
+def hide(device):
+    os.makedirs(os.path.dirname(FLAG), exist_ok=True)
+    open(FLAG, "w").close()
+    replug(device)
+
+
+def release():
+    device = find_keyboard()
+    if os.path.exists(FLAG):
+        os.remove(FLAG)
+        if device:
+            replug(device)
+
+
+def emit(fd, typ, code, value):
+    os.write(fd, EVENT.pack(0, 0, typ, code, value))
+
+
+def main():
+    if sys.argv[1:] == ["--release"]:
+        release()
+        return
+    device = None
+    while not device:
+        device = find_keyboard() or time.sleep(1)
+
+    kbd = os.open(device, os.O_RDWR)
+    ui = os.open("/dev/uinput", os.O_WRONLY)
+    fcntl.ioctl(ui, UI_SET_EVBIT, EV_KEY)
+    for code in range(1, 256):
+        fcntl.ioctl(ui, UI_SET_KEYBIT, code)
+    # struct uinput_setup: input_id (bustype, vendor, product, version), name[80], ff_effects_max
+    setup = struct.pack("HHHH80sI", 0x06, 0x1d6b, 0x0104, 1, b"ohmarchy caps-super keyboard", 0)
+    fcntl.ioctl(ui, UI_DEV_SETUP, setup)
+    fcntl.ioctl(ui, UI_DEV_CREATE)
+    time.sleep(0.5)
+    fcntl.ioctl(kbd, EVIOCGRAB, 1)
+    hide(device)
+
+    def read(timeout=None):
+        if timeout is not None and not select.select([kbd], [], [], timeout)[0]:
+            return None
+        return EVENT.unpack(os.read(kbd, EVENT.size))[2:]
+
+    def toggle(code):
+        nonlocal leds
+        led = LOCK_LEDS[code]
+        leds ^= 1 << led
+        emit(kbd, EV_LED, led, (leds >> led) & 1)
+        emit(kbd, EV_SYN, 0, 0)
+
+    leds = int.from_bytes(fcntl.ioctl(kbd, EVIOCGLED, bytes(8)), "little")
+    corrected = {}
+    backlog = []
+    while True:
+        typ, code, value = backlog.pop(0) if backlog else read()
+        if typ == EV_SYN:
+            emit(ui, EV_SYN, 0, 0)
+        if typ != EV_KEY:
+            continue
+
+        if code in LOCK_LEDS and value == 1:
+            # Look ahead for the release that marks a press HarmonyOS added.
+            ahead, added = [], False
+            deadline = time.monotonic() + TAP_SECONDS
+            while (left := deadline - time.monotonic()) > 0 and (event := read(left)):
+                ahead.append(event)
+                if event[0] == EV_KEY:
+                    added = event[1] == code and event[2] == 0
+                    break
+            if added:
+                now = time.monotonic()
+                if now - corrected.get(code, 0) > SETTLE_SECONDS:
+                    toggle(code)
+                    corrected[code] = now
+                continue
+            toggle(code)
+            backlog = ahead + backlog
+
+        emit(ui, EV_KEY, KEY_RIGHTMETA if code == KEY_CAPSLOCK else code, value)
+
+main()

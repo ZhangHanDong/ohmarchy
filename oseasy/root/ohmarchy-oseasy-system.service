@@ -1,0 +1,14 @@
+[Unit]
+Description=ohmarchy: adapt Omarchy to the Oseasy VM (kernel, boot entries, disk)
+# Before Omarchy's first-boot provisioning: it rebuilds limine.conf and must find
+# the patched kernel package already installed.
+After=local-fs.target
+Before=omarchy-provision-owner.service display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/ohmarchy-oseasy-setup system
+
+[Install]
+WantedBy=multi-user.target

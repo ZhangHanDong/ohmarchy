@@ -1,0 +1,4 @@
+# ohmarchy (Oseasy VM): while ohmarchy-caps-super runs (it creates the flag), it
+# owns the real keyboard and its LEDs, and the compositor gets the keys from the
+# "ohmarchy caps-super keyboard" instead.
+ACTION=="add|change", KERNEL=="event*", ATTRS{name}=="StratoVirt StratoVirt USB Keyboard", TEST=="/run/ohmarchy/caps-super", ENV{LIBINPUT_IGNORE_DEVICE}="1"

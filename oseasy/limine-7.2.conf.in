@@ -1,0 +1,8 @@
+
+/Omarchy  patched 7.2 kernel, efidrm KMS
+protocol: efi
+path: boot():/EFI/Linux/ohmarchy-7.2.efi
+
+/Omarchy  patched 7.2 kernel, earlycon on the EFI framebuffer (debug)
+protocol: efi
+path: boot():/EFI/Linux/ohmarchy-7.2-earlycon.efi

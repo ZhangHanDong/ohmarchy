@@ -1,0 +1,147 @@
+#!/usr/bin/python3
+# ohmarchy-edge-swipe: touch-screen edge swipes on the Oseasy VM.
+#
+# Oseasy turns touches on the HarmonyOS screen into a single absolute pointer
+# (the USB tablet), so multi-finger gestures never reach the guest. This grabs
+# that pointer and passes it on through an identical virtual one, except for a
+# quick sideways swipe that starts at an edge of the screen:
+#   from the right edge, leftwards  -> next workspace
+#   from the left edge, rightwards  -> previous workspace
+#   along the bottom edge           -> the window to the right (leftwards) or left
+# A touch that starts at an edge is held back until it is clearly a swipe or not;
+# a tap or any other movement is then replayed unchanged. If this exits, the
+# grab goes with it and the tablet works directly again.
+import fcntl
+import glob
+import os
+import select
+import struct
+import subprocess
+import time
+
+EV_SYN, EV_KEY, EV_REL, EV_ABS, EV_MSC = 0, 1, 2, 3, 4
+ABS_X, ABS_Y, BTN_LEFT = 0, 1, 272
+EVENT = struct.Struct("qqHHi")
+EVIOCGRAB = 0x40044590
+UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_RELBIT, UI_SET_MSCBIT = 0x40045564, 0x40045565, 0x40045566, 0x40045568
+UI_DEV_SETUP, UI_DEV_CREATE, UI_ABS_SETUP = 0x405c5503, 0x5501, 0x401c5504
+
+MAX = 32767
+EDGE = 0.05 * MAX  # how close to an edge a swipe has to start
+DISTANCE = 0.12 * MAX  # how far sideways it has to go
+SECONDS = 1.0  # and how quickly
+
+
+def find_tablet():
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            name = open(path + "/device/name").read().strip()
+        except OSError:
+            continue
+        if name == "StratoVirt StratoVirt USB Tablet Mouse":
+            return "/dev/input/" + os.path.basename(path)
+    return None
+
+
+def hyprland(dispatcher):
+    sockets = glob.glob("/run/user/*/hypr/*/.socket.sock")
+    if not sockets:
+        return
+    socket = max(sockets, key=os.path.getmtime)
+    instance = os.path.dirname(socket)
+    env = dict(os.environ, XDG_RUNTIME_DIR=os.path.dirname(os.path.dirname(instance)),
+               HYPRLAND_INSTANCE_SIGNATURE=os.path.basename(instance))
+    subprocess.run(["hyprctl", "dispatch", dispatcher], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def workspace(step):
+    hyprland('hl.dsp.focus({ workspace = "r%+d" })' % step)
+
+
+def window(direction):
+    hyprland('hl.dsp.focus({ direction = "%s" })' % direction)
+
+
+def virtual_tablet():
+    ui = os.open("/dev/uinput", os.O_WRONLY)
+    for ev in (EV_KEY, EV_REL, EV_ABS, EV_MSC):
+        fcntl.ioctl(ui, UI_SET_EVBIT, ev)
+    for code in range(BTN_LEFT, BTN_LEFT + 5):
+        fcntl.ioctl(ui, UI_SET_KEYBIT, code)
+    for code in (6, 8, 11, 12):  # REL_HWHEEL, REL_WHEEL and their hi-res forms
+        fcntl.ioctl(ui, UI_SET_RELBIT, code)
+    fcntl.ioctl(ui, UI_SET_MSCBIT, 4)  # MSC_SCAN
+    for code in (ABS_X, ABS_Y):
+        fcntl.ioctl(ui, UI_ABS_SETUP, struct.pack("H2x6i", code, 0, 0, MAX, 0, 0, 0))
+    setup = struct.pack("HHHH80sI", 0x06, 0x1d6b, 0x0105, 1, b"ohmarchy edge-swipe tablet", 0)
+    fcntl.ioctl(ui, UI_DEV_SETUP, setup)
+    fcntl.ioctl(ui, UI_DEV_CREATE)
+    return ui
+
+
+def main():
+    device = None
+    while not device:
+        device = find_tablet() or time.sleep(1)
+    tablet = os.open(device, os.O_RDONLY)
+    ui = virtual_tablet()
+    time.sleep(0.5)
+    fcntl.ioctl(tablet, EVIOCGRAB, 1)
+
+    def forward(frame):
+        os.write(ui, b"".join(EVENT.pack(0, 0, *event) for event in frame))
+
+    x = y = 0
+    mode = "pass"  # or "held": an edge touch not decided yet; "swipe": swallowed until lifted
+    held, start = [], None
+    frame = []
+    while True:
+        typ, code, value = EVENT.unpack(os.read(tablet, EVENT.size))[2:]
+        frame.append((typ, code, value))
+        if typ != EV_SYN:
+            continue
+        pressed = released = False
+        for t, c, v in frame:
+            if t == EV_ABS and c == ABS_X:
+                x = v
+            elif t == EV_ABS and c == ABS_Y:
+                y = v
+            elif t == EV_KEY and c == BTN_LEFT:
+                pressed, released = v == 1, v == 0
+        current, frame = frame, []
+
+        if mode == "pass":
+            edge = "left" if x < EDGE else "right" if x > MAX - EDGE else "bottom" if y > MAX - EDGE else None
+            if pressed and edge:
+                mode, held, start = "held", [current], (edge, x, y, time.monotonic())
+            else:
+                forward(current)
+            continue
+
+        if mode == "swipe":
+            if released:
+                forward([(EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y), (EV_SYN, 0, 0)])
+                mode = "pass"
+            continue
+
+        held.append(current)
+        edge, sx, sy, since = start
+        dx, dy = x - sx, y - sy
+        sideways = abs(dx) > DISTANCE and abs(dy) < abs(dx) / 2
+        inwards = (edge == "left" and dx > 0) or (edge == "right" and dx < 0) or edge == "bottom"
+        if sideways and inwards and time.monotonic() - since < SECONDS:
+            if edge == "left":
+                workspace(-1)
+            elif edge == "right":
+                workspace(+1)
+            else:
+                window("r" if dx < 0 else "l")
+            mode, held = "pass" if released else "swipe", []
+            continue
+        if released or time.monotonic() - since > SECONDS or abs(dy) > DISTANCE:
+            for f in held:
+                forward(f)
+            mode, held = "pass", []
+
+
+main()

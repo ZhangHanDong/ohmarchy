@@ -1,0 +1,14 @@
+[Unit]
+Description=ohmarchy: Caps Lock as SUPER on the Oseasy VM keyboard, in step with the HarmonyOS lock keys
+# It hides the real keyboard from libinput while it runs, so it starts before the
+# compositor, and gives the keyboard back when it stops, however it stops.
+Before=display-manager.service
+
+[Service]
+ExecStart=/usr/local/libexec/ohmarchy-caps-super
+Restart=always
+RestartSec=1
+ExecStopPost=/usr/local/libexec/ohmarchy-caps-super --release
+
+[Install]
+WantedBy=multi-user.target
