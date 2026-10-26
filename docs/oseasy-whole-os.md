@@ -155,7 +155,7 @@ so the guest always listens:
 |---|---|
 | 5000 | root shell (busybox `tcpsvd`) |
 | 5001 | upload: first line is the destination path, then the bytes |
-| 5002/5003 | one-shot transfers used by `tools/fold/guest-put.sh` and `guest-get.sh` |
+| 5100-5899 | one-shot transfers used by `tools/fold/guest-put.sh` and `guest-get.sh` (a fresh port each, checked by sha256) |
 
 ## Reinstall or reset
 
